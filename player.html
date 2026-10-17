@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Cinema Player</title>
+<style>
+@font-face { font-family: 'GESS'; src: url('fonts/ge_ss.ttf'); }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #03050a; font-family: 'GESS', Tahoma, Arial, sans-serif; color: #e6f6ff; }
+
+video, iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; display: none; }
+video { object-fit: contain; }
+
+/* شاشة الانتظار */
+#idle { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2.2vh;
+  background: radial-gradient(ellipse at 50% 40%, #0b1a33 0%, #05080f 70%); overflow: hidden; }
+#idle::before { content: ''; position: absolute; inset: -50%; background-image:
+  linear-gradient(rgba(34,211,238,.10) 1px, transparent 1px), linear-gradient(90deg, rgba(34,211,238,.10) 1px, transparent 1px);
+  background-size: 6vh 6vh; transform: perspective(60vh) rotateX(62deg) translateY(0); animation: grid 6s linear infinite; }
+@keyframes grid { to { background-position: 0 6vh; } }
+.ring { width: 22vh; height: 22vh; border-radius: 50%; position: relative; border: .5vh solid rgba(34,211,238,.35);
+  box-shadow: 0 0 6vh rgba(34,211,238,.35), inset 0 0 4vh rgba(167,139,250,.25); animation: pulse 3s ease-in-out infinite; z-index: 1;
+  display: flex; align-items: center; justify-content: center; }
+.ring::after { content: ''; border-left: 7vh solid #22d3ee; border-top: 4.2vh solid transparent; border-bottom: 4.2vh solid transparent;
+  transform: translateX(-.8vh) scaleX(-1); filter: drop-shadow(0 0 1.4vh #22d3ee); }
+@keyframes pulse { 50% { transform: scale(1.06); box-shadow: 0 0 9vh rgba(167,139,250,.5), inset 0 0 5vh rgba(34,211,238,.3); } }
+.name { font-size: 8vh; letter-spacing: .6vh; z-index: 1; background: linear-gradient(90deg, #22d3ee, #a78bfa, #f472b6); -webkit-background-clip: text; color: transparent; }
+.sub { font-size: 3vh; opacity: .65; z-index: 1; letter-spacing: .4vh; }
+
+/* عنوان التشغيل */
+#banner { position: absolute; bottom: 7%; right: 5%; max-width: 70%; padding: 1.6vh 3vh; border-radius: 1.6vh; font-size: 4vh;
+  background: rgba(5,10,20,.72); border: 1px solid rgba(34,211,238,.45); box-shadow: 0 0 3vh rgba(34,211,238,.25);
+  opacity: 0; transform: translateY(2vh); transition: all .6s ease; pointer-events: none; z-index: 5; }
+#banner.show { opacity: 1; transform: none; }
+</style>
+</head>
+<body>
+<div id="idle"><div class="ring"></div><div class="name">KINGDOMSC CINEMA</div><div class="sub">السنما</div></div>
+<video id="v" playsinline></video>
+<iframe id="yt" allow="autoplay; encrypted-media" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+<div id="banner"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script>
+(function () {
+  const idle = document.getElementById('idle');
+  const v = document.getElementById('v');
+  const yt = document.getElementById('yt');
+  const banner = document.getElementById('banner');
+
+  let cur = { rev: null, url: '', kind: null, status: 'idle' };
+  let target = null;      // { pos, at, status, loop }
+  let hls = null;
+  let volume = 0;
+  let bannerTimer = null;
+
+  const kindOf = (u) => /(youtube\.com|youtu\.be)/i.test(u) ? 'youtube' : (/\.m3u8(\?|$)/i.test(u) ? 'hls' : 'video');
+  const ytId = (u) => { const m = u.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([\w-]{11})/); return m ? m[1] : null; };
+
+  function show(which) {
+    idle.style.display = which === 'idle' ? 'flex' : 'none';
+    v.style.display = (which === 'video') ? 'block' : 'none';
+    yt.style.display = (which === 'yt') ? 'block' : 'none';
+  }
+
+  function ytCmd(func, args) {
+    try { yt.contentWindow.postMessage(JSON.stringify({ event: 'command', func: func, args: args || [] }), '*'); } catch (e) {}
+  }
+
+  function setVolume(p) {
+    volume = Math.max(0, Math.min(100, p));
+    v.volume = volume / 100;
+    if (cur.kind === 'youtube') ytCmd('setVolume', [volume]);
+  }
+
+  function clearAll() {
+    try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {}
+    if (hls) { hls.destroy(); hls = null; }
+    yt.src = 'about:blank';
+    cur = { rev: null, url: '', kind: null, status: 'idle' };
+    target = null;
+    show('idle');
+  }
+
+  function showBanner(t) {
+    if (!t) return;
+    banner.textContent = t;
+    banner.classList.add('show');
+    clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(() => banner.classList.remove('show'), 6000);
+  }
+
+  function expected() {
+    if (!target) return 0;
+    let p = target.pos + (target.status === 'playing' ? (Date.now() - target.at) / 1000 : 0);
+    if (target.loop && isFinite(v.duration) && v.duration > 0) p = p % v.duration;
+    return Math.max(0, p);
+  }
+
+  function applyVideoSync(hard) {
+    if (!target || cur.kind === 'youtube') return;
+    const want = expected();
+    if (v.readyState >= 1) {
+      if (hard || Math.abs(v.currentTime - want) > 2.5) {
+        if (!isFinite(v.duration) || want < v.duration) v.currentTime = want;
+      }
+    }
+    if (target.status === 'playing') {
+      if (v.paused) {
+        const pr = v.play();
+        if (pr && pr.catch) pr.catch(() => { v.muted = true; v.play().catch(() => {}); });
+      }
+    } else if (!v.paused) {
+      v.pause();
+    }
+  }
+
+  function applyYtSync(hard) {
+    if (!target || cur.kind !== 'youtube') return;
+    ytCmd(target.status === 'playing' ? 'playVideo' : 'pauseVideo');
+    if (hard) ytCmd('seekTo', [expected(), true]);
+    ytCmd('setVolume', [volume]);
+  }
+
+  function loadMedia(m) {
+    const k = kindOf(m.url);
+    cur.kind = k; cur.url = m.url;
+    if (hls) { hls.destroy(); hls = null; }
+    if (k === 'youtube') {
+      const id = ytId(m.url);
+      if (!id) { clearAll(); return; }
+      try { v.pause(); v.removeAttribute('src'); } catch (e) {}
+      yt.src = 'https://www.youtube-nocookie.com/embed/' + id + '?autoplay=1&controls=0&disablekb=1&rel=0&modestbranding=1&playsinline=1&enablejsapi=1&start=' +
+        Math.floor(m.position || 0) + '&loop=' + (m.loop ? 1 : 0) + '&playlist=' + id;
+      show('yt');
+      setTimeout(() => applyYtSync(false), 2500);
+      return;
+    }
+    yt.src = 'about:blank';
+    v.loop = !!m.loop;
+    if (k === 'hls' && window.Hls && Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(m.url);
+      hls.attachMedia(v);
+    } else {
+      v.src = m.url;
+    }
+    show('video');
+    v.volume = volume / 100;
+    v.muted = false;
+  }
+
+  v.addEventListener('loadedmetadata', () => applyVideoSync(true));
+  v.addEventListener('canplay', () => applyVideoSync(false));
+
+  function onState(m) {
+    if (!m.url || m.status === 'idle') { if (cur.kind) clearAll(); return; }
+
+    const sameMedia = (cur.url === m.url && cur.kind && cur.kind !== 'youtube');
+    const revChanged = cur.rev !== m.rev;
+    target = { pos: m.position || 0, at: Date.now(), status: m.status, loop: !!m.loop };
+
+    if (revChanged && !sameMedia) {
+      cur.rev = m.rev;
+      loadMedia(m);
+      showBanner(m.title);
+      cur.status = m.status;
+      return;
+    }
+    if (revChanged && sameMedia) {   // تقديم/تأخير على نفس الفيديو
+      cur.rev = m.rev;
+      applyVideoSync(true);
+      cur.status = m.status;
+      return;
+    }
+    // نفس الإصدار: تحديث الحالة (إيقاف مؤقت/استئناف/تصحيح الانحراف)
+    if (cur.kind === 'youtube') applyYtSync(cur.status !== m.status);
+    else applyVideoSync(cur.status !== m.status);
+    cur.status = m.status;
+  }
+
+  window.addEventListener('message', (e) => {
+    let d = e.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) { return; } }
+    if (!d || !d.type) return;
+    if (d.type === 'state') onState(d);
+    else if (d.type === 'volume') setVolume(Number(d.volume) || 0);
+    else if (d.type === 'clear') clearAll();
+  });
+
+  show('idle');
+})();
+</script>
+</body>
+</html>
